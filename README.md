@@ -1,1 +1,1 @@
-# MS_Sentinel
+# Microsoft_Sentinel
