@@ -1,0 +1,374 @@
+// ====================================================================================================
+// Name:        Microsoft Sentinel Ingestion Health & Cost Analysis
+//
+// Description:
+// This query analyzes billable Microsoft Sentinel ingestion using the Azure Monitor Usage table.
+// It compares current month-to-date ingestion against the previous month and the equivalent
+// reporting period, calculates ingestion trends, projects month-end consumption, and identifies
+// potential data collection issues or cost optimization opportunities.
+//
+// Key Capabilities:
+// - Compare current and previous month ingestion volumes
+// - Calculate daily ingestion averages
+// - Project month-end ingestion consumption
+// - Identify high-volume tables
+// - Detect ingestion increases and decreases
+// - Detect new, missing, or stale data sources
+// - Highlight potential cost optimization candidates
+// - Measure each table's percentage contribution to total ingestion
+//
+// Use Cases:
+// - Microsoft Sentinel cost optimization reviews
+// - SOC operational health assessments
+// - Data collection validation
+// - Capacity planning and forecasting
+// - Monthly service reviews
+// - Customer architecture workshops
+//
+// Requirements:
+// - Microsoft Sentinel enabled
+// - Log Analytics Workspace access
+// - Permission to read the Usage table
+//
+// Notes:
+// - Projected values are estimates based on current ingestion trends.
+// - Attention thresholds can be adjusted to align with organizational requirements.
+// - Results should be interpreted alongside recent connector, retention,
+//   onboarding, and optimization changes.
+//
+// GitHub:
+// https://github.com/RamiMustafa/MS_Sentinel
+// Author:      Rami Mustafa, Sr. Cybersecurity Cloud Solutions Architect, Microsoft
+// Version:     1.0.0
+// Last Update: 2026-10-05
+// ====================================================================================================
+
+
+let CurrentMonthStart = startofmonth(now());
+let PreviousMonthStart =
+    startofmonth(datetime_add("month", -1, CurrentMonthStart));
+let PreviousMonthEnd = CurrentMonthStart;
+let NextMonthStart =
+    startofmonth(datetime_add("month", 1, CurrentMonthStart));
+
+// Include the current UTC calendar day.
+// The current day is incomplete, so projections can vary during the day.
+let CurrentMonthElapsedDays =
+    datetime_diff("day", startofday(now()), CurrentMonthStart) + 1;
+
+let PreviousEquivalentEnd =
+    min_of(
+        PreviousMonthEnd,
+        datetime_add(
+            "day",
+            CurrentMonthElapsedDays,
+            PreviousMonthStart
+        )
+    );
+
+let DaysInCurrentMonth =
+    datetime_diff(
+        "day",
+        NextMonthStart,
+        CurrentMonthStart
+    );
+
+let DaysInPreviousMonth =
+    datetime_diff(
+        "day",
+        PreviousMonthEnd,
+        PreviousMonthStart
+    );
+
+let TableUsage = materialize(
+    Usage
+    | where TimeGenerated >= PreviousMonthStart
+    | where TimeGenerated < NextMonthStart
+    | where IsBillable == true
+    | summarize
+        PreviousMonthGB =
+            sumif(
+                Quantity,
+                TimeGenerated >= PreviousMonthStart
+                    and TimeGenerated < PreviousMonthEnd
+            ) / 1000.0,
+
+        PreviousEquivalentPeriodGB =
+            sumif(
+                Quantity,
+                TimeGenerated >= PreviousMonthStart
+                    and TimeGenerated < PreviousEquivalentEnd
+            ) / 1000.0,
+
+        CurrentMonthGB =
+            sumif(
+                Quantity,
+                TimeGenerated >= CurrentMonthStart
+                    and TimeGenerated < now()
+            ) / 1000.0,
+
+        PreviousMonthLastIngestion =
+            maxif(
+                EndTime,
+                TimeGenerated >= PreviousMonthStart
+                    and TimeGenerated < PreviousMonthEnd
+            ),
+
+        CurrentMonthLastIngestion =
+            maxif(
+                EndTime,
+                TimeGenerated >= CurrentMonthStart
+                    and TimeGenerated < now()
+            ),
+
+        Plan = take_any(Plan),
+
+        Solutions =
+            make_set_if(
+                Solution,
+                isnotempty(Solution),
+                10
+            ),
+
+        SourceSystems =
+            make_set_if(
+                SourceSystem,
+                isnotempty(SourceSystem),
+                10
+            )
+        by DataType
+);
+
+let TotalCurrentMonthGB =
+    toscalar(
+        TableUsage
+        | summarize Total = sum(CurrentMonthGB)
+    );
+
+TableUsage
+
+// Base calculations
+| extend
+    PreviousDailyAverageGB =
+        PreviousMonthGB / todouble(DaysInPreviousMonth),
+
+    CurrentDailyAverageGB =
+        CurrentMonthGB / todouble(CurrentMonthElapsedDays),
+
+    FullMonthChangeGB =
+        CurrentMonthGB - PreviousMonthGB,
+
+    EquivalentPeriodChangeGB =
+        CurrentMonthGB - PreviousEquivalentPeriodGB,
+
+    EquivalentPeriodChangePct =
+        iff(
+            PreviousEquivalentPeriodGB > 0,
+            100.0
+                * (CurrentMonthGB - PreviousEquivalentPeriodGB)
+                / PreviousEquivalentPeriodGB,
+            real(null)
+        ),
+
+    PercentOfCurrentTotal =
+        iff(
+            TotalCurrentMonthGB > 0,
+            100.0
+                * CurrentMonthGB
+                / TotalCurrentMonthGB,
+            real(null)
+        ),
+
+    HoursSinceLastIngestion =
+        iff(
+            isnotnull(CurrentMonthLastIngestion),
+            datetime_diff(
+                "hour",
+                now(),
+                CurrentMonthLastIngestion
+            ),
+            long(null)
+        )
+
+// Dependent calculation must be in a subsequent extend
+| extend
+    ProjectedMonthEndGB =
+        CurrentDailyAverageGB * todouble(DaysInCurrentMonth)
+
+// These depend on ProjectedMonthEndGB, so use another extend
+| extend
+    ProjectedChangeGB =
+        ProjectedMonthEndGB - PreviousMonthGB,
+
+    ProjectedChangePct =
+        iff(
+            PreviousMonthGB > 0,
+            100.0
+                * (ProjectedMonthEndGB - PreviousMonthGB)
+                / PreviousMonthGB,
+            real(null)
+        )
+
+// Assign attention status
+| extend
+    Attention = case(
+        PreviousMonthGB > 0
+            and CurrentMonthGB == 0,
+            "CRITICAL - NO DATA",
+
+        CurrentMonthGB > 0
+            and HoursSinceLastIngestion >= 24,
+            "CRITICAL - STALE",
+
+        PreviousMonthGB == 0
+            and CurrentMonthGB > 0,
+            "REVIEW - NEW TABLE",
+
+        EquivalentPeriodChangePct <= -50
+            and PreviousEquivalentPeriodGB >= 1,
+            "HIGH DECREASE",
+
+        ProjectedChangePct >= 50
+            and ProjectedChangeGB >= 100,
+            "HIGH INCREASE",
+
+        ProjectedChangePct >= 25
+            and ProjectedChangeGB >= 10,
+            "INCREASE",
+
+        PercentOfCurrentTotal >= 10,
+            "HIGH VOLUME",
+
+        ProjectedChangePct <= -25
+            and PreviousMonthGB >= 1,
+            "DECREASE",
+
+        "OK"
+    )
+
+// Human-readable explanation
+| extend
+    AttentionReason = case(
+        Attention == "CRITICAL - NO DATA",
+            "Had billable ingestion last month but none this month",
+
+        Attention == "CRITICAL - STALE",
+            strcat(
+                "No billable ingestion for ",
+                tostring(HoursSinceLastIngestion),
+                " hours"
+            ),
+
+        Attention == "REVIEW - NEW TABLE",
+            "No billable ingestion last month; ingestion started this month",
+
+        Attention == "HIGH DECREASE",
+            strcat(
+                "MTD ingestion is ",
+                tostring(
+                    round(
+                        abs(EquivalentPeriodChangePct),
+                        1
+                    )
+                ),
+                "% below the equivalent prior-month period"
+            ),
+
+        Attention == "HIGH INCREASE",
+            strcat(
+                "Projected increase is ",
+                tostring(round(ProjectedChangeGB, 2)),
+                " GB / ",
+                tostring(round(ProjectedChangePct, 1)),
+                "%"
+            ),
+
+        Attention == "INCREASE",
+            strcat(
+                "Projected month-end increase is ",
+                tostring(round(ProjectedChangePct, 1)),
+                "%"
+            ),
+
+        Attention == "HIGH VOLUME",
+            strcat(
+                "Table represents ",
+                tostring(round(PercentOfCurrentTotal, 2)),
+                "% of current billable ingestion"
+            ),
+
+        Attention == "DECREASE",
+            strcat(
+                "Projected month-end decrease is ",
+                tostring(
+                    round(
+                        abs(ProjectedChangePct),
+                        1
+                    )
+                ),
+                "%"
+            ),
+
+        "Within configured thresholds"
+    )
+
+// Sort critical results first
+| extend
+    AttentionOrder = case(
+        Attention startswith "CRITICAL", 1,
+        Attention == "REVIEW - NEW TABLE", 2,
+        Attention startswith "HIGH", 3,
+        Attention in ("INCREASE", "DECREASE"), 4,
+        5
+    )
+
+| project
+    Table = DataType,
+    Plan,
+    Solutions,
+    SourceSystems,
+
+    PreviousMonthGB =
+        round(PreviousMonthGB, 2),
+
+    PreviousEquivalentPeriodGB =
+        round(PreviousEquivalentPeriodGB, 2),
+
+    CurrentMonthGB =
+        round(CurrentMonthGB, 2),
+
+    EquivalentPeriodChangeGB =
+        round(EquivalentPeriodChangeGB, 2),
+
+    EquivalentPeriodChangePct =
+        round(EquivalentPeriodChangePct, 1),
+
+    PreviousDailyAverageGB =
+        round(PreviousDailyAverageGB, 2),
+
+    CurrentDailyAverageGB =
+        round(CurrentDailyAverageGB, 2),
+
+    ProjectedMonthEndGB =
+        round(ProjectedMonthEndGB, 2),
+
+    ProjectedChangeGB =
+        round(ProjectedChangeGB, 2),
+
+    ProjectedChangePct =
+        round(ProjectedChangePct, 1),
+
+    PercentOfCurrentTotal =
+        round(PercentOfCurrentTotal, 2),
+
+    CurrentMonthLastIngestion,
+    HoursSinceLastIngestion,
+    Attention,
+    AttentionReason,
+    AttentionOrder
+
+| order by
+    AttentionOrder asc,
+    CurrentMonthGB desc
+
+| project-away AttentionOrder
